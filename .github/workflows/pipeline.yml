@@ -1,0 +1,192 @@
+name: Tourism Project Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  register-dataset:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas huggingface_hub
+
+      - name: Validate Dataset
+        run: |
+          python -c "import pandas as pd; df=pd.read_csv('data/tourism.csv'); print('Dataset shape:', df.shape); print('Dataset registration validation successful.')"
+
+      - name: Upload Dataset to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -c "from huggingface_hub import HfApi; import os; api=HfApi(token=os.environ['HF_TOKEN']); repo_id='rhythm0511/tourism-purchase-prediction-data'; api.create_repo(repo_id=repo_id, repo_type='dataset', exist_ok=True); api.upload_file(path_or_fileobj='data/tourism.csv', path_in_repo='tourism.csv', repo_id=repo_id, repo_type='dataset'); print('Dataset uploaded successfully to Hugging Face Hub.')"
+
+
+  data-prep:
+    needs: register-dataset
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas scikit-learn
+
+      - name: Run Data Preparation Validation
+        run: |
+          python -c "import pandas as pd; from sklearn.model_selection import train_test_split; df=pd.read_csv('data/tourism.csv'); df=df.drop(columns=['Unnamed: 0','CustomerID']); df['Gender']=df['Gender'].replace({'Fe Male':'Female'}); X=df.drop(columns=['ProdTaken']); y=df['ProdTaken']; X_train,X_test,y_train,y_test=train_test_split(X,y,test_size=0.2,random_state=42,stratify=y); print('Cleaned dataset shape:', df.shape); print('Training rows:', len(X_train)); print('Testing rows:', len(X_test)); print('Data preparation successful.')"
+
+
+  model-traning:
+    needs: data-prep
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas scikit-learn xgboost mlflow joblib
+
+      - name: Start MLflow Server
+        run: |
+          nohup mlflow ui --host 0.0.0.0 --port 5000 > mlflow.log 2>&1 &
+          sleep 5
+
+      - name: Model Building
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          import joblib
+          from sklearn.model_selection import train_test_split
+          from sklearn.compose import ColumnTransformer
+          from sklearn.preprocessing import OneHotEncoder
+          from sklearn.pipeline import Pipeline
+          from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+          from xgboost import XGBClassifier
+
+          df = pd.read_csv("data/tourism.csv")
+
+          df = df.drop(columns=["Unnamed: 0", "CustomerID"])
+          df["Gender"] = df["Gender"].replace({"Fe Male": "Female"})
+
+          X = df.drop(columns=["ProdTaken"])
+          y = df["ProdTaken"]
+
+          X_train, X_test, y_train, y_test = train_test_split(
+              X, y,
+              test_size=0.20,
+              random_state=42,
+              stratify=y
+          )
+
+          categorical_cols = X.select_dtypes(include=["object"]).columns.tolist()
+
+          preprocessor = ColumnTransformer(
+              [
+                  (
+                      "categorical",
+                      OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                      categorical_cols
+                  )
+              ],
+              remainder="passthrough"
+          )
+
+          model = XGBClassifier(
+              learning_rate=0.1,
+              max_depth=5,
+              n_estimators=200,
+              subsample=0.8,
+              eval_metric="logloss",
+              random_state=42
+          )
+
+          pipeline = Pipeline([
+              ("preprocessor", preprocessor),
+              ("model", model)
+          ])
+
+          pipeline.fit(X_train, y_train)
+
+          predictions = pipeline.predict(X_test)
+          probabilities = pipeline.predict_proba(X_test)[:, 1]
+
+          print("Accuracy:", accuracy_score(y_test, predictions))
+          print("Precision:", precision_score(y_test, predictions))
+          print("Recall:", recall_score(y_test, predictions))
+          print("F1 Score:", f1_score(y_test, predictions))
+          print("ROC-AUC:", roc_auc_score(y_test, probabilities))
+
+          joblib.dump(pipeline, "final_model.joblib")
+
+          print("Model training successful.")
+          PY
+
+      - name: Upload Model Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: final_model.joblib
+
+
+  deploy-hosting:
+    needs: [model-traning, data-prep, register-dataset]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Model Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: deployment
+
+      - name: Install Dependencies
+        run: |
+          pip install huggingface_hub
+
+      - name: Validate Deployment Files
+        run: |
+          test -f deployment/app.py
+          test -f deployment/Dockerfile
+          test -f deployment/requirements.txt
+          test -f deployment/final_model.joblib
+          echo "Deployment package validated successfully."
+
+      - name: Deployment Package Ready
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          echo "Deployment package prepared successfully."
+          echo "Model Hub repository: rhythm0511/tourism-purchase-prediction"
+          echo "Deployment hosting requires a compute-enabled Hugging Face Space."
